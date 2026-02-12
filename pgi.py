@@ -44,6 +44,31 @@ COUNT_LIST = [
 "SRT254470","SRT254592","SRT255171","SRV250013","SRP255007"
 ]
 
+DETAIL_COLUMNS = [
+    "Chassis",
+    "Mismatch_Type",
+    "SalesOrder_3120",
+    "SalesOrder_3110",
+    "SalesOrderPGI_Doc_3120",
+    "SalesOrderPGI_Doc_3110",
+    "PGI_Date_3120",
+    "PGI_Date_3110",
+    "Reverse_PGI_3120",
+    "Reverse_PGI_3110",
+    "Last_Movement_Is_PGI_3120",
+    "Last_Movement_Is_PGI_3110",
+    "Invoice_No_3120",
+    "PO_Number_3120",
+    "PO_Number_Count",
+    "PO_GR_Date_3120",
+    "BillTo_3110",
+    "BillTo_3120",
+    "BP_Received_Amount_3120",
+    "PO_Creator",
+    "SO_Creator_3120",
+    "BillTo_Name_3120",
+]
+
 # ================= DB =================
 
 def hana_query(sql):
@@ -115,65 +140,279 @@ def build_mismatch(sap_set):
     for s in all_serial:
         if s in list_set and s in sap_set:
             continue
-        elif s in list_set:
+        if s in list_set:
             rows.append([s, "Only in List"])
         else:
             rows.append([s, "Only in SAP"])
 
-    return pd.DataFrame(rows, columns=["Chassis","Mismatch_Type"])
+    return pd.DataFrame(rows, columns=["Chassis", "Mismatch_Type"])
 
 
-# ================= STEP 3A: 统计 (3120 only) =================
+# ================= STEP 3: Mismatch 明细 =================
 
-def fetch_statistics(serial_list):
+def fetch_mismatch_details(df_mismatch):
+    if df_mismatch.empty:
+        return pd.DataFrame(columns=DETAIL_COLUMNS)
 
+    serial_list = df_mismatch["Chassis"].dropna().unique().tolist()
     in_list = "(" + ",".join(f"'{c}'" for c in serial_list) + ")"
 
     sql = f"""
+    WITH target AS (
+        SELECT DISTINCT
+            obj."SERNR" AS "Chassis"
+        FROM "SAPHANADB"."OBJK" obj
+        WHERE obj."SERNR" IN {in_list}
+    ),
+    base AS (
+        SELECT DISTINCT
+            t."Chassis",
+            s."SDAUFNR" AS "SalesOrder"
+        FROM target t
+        LEFT JOIN "SAPHANADB"."OBJK" obj
+          ON obj."SERNR" = t."Chassis"
+        LEFT JOIN "SAPHANADB"."SER02" s
+          ON obj."OBKNR" = s."OBKNR"
+    ),
+    so_3120 AS (
+        SELECT
+            b."Chassis",
+            MAX(v."VBELN") AS "SalesOrder_3120",
+            MAX(v."ERNAM") AS "SO_Creator_3120"
+        FROM base b
+        JOIN "SAPHANADB"."VBAK" v
+          ON b."SalesOrder" = v."VBELN"
+         AND v."VKORG" = '3120'
+        GROUP BY b."Chassis"
+    ),
+    so_3110 AS (
+        SELECT b."Chassis", MAX(v."VBELN") AS "SalesOrder_3110"
+        FROM base b
+        JOIN "SAPHANADB"."VBAK" v
+          ON b."SalesOrder" = v."VBELN"
+         AND v."VKORG" = '3110'
+        GROUP BY b."Chassis"
+    ),
+    move_3120 AS (
+        SELECT
+            s."Chassis",
+            MAX(CASE WHEN m."BWART"='601' THEN m."MBLNR" END) AS "SalesOrderPGI_Doc_3120",
+            MAX(CASE WHEN m."BWART"='601' THEN m."BUDAT_MKPF" END) AS "PGI_Date_3120",
+            CASE WHEN SUM(CASE WHEN m."BWART"='602' THEN 1 ELSE 0 END) > 0 THEN 'Y' ELSE 'N' END AS "Reverse_PGI_3120",
+            CASE WHEN MAX(m."BWART") = '601' THEN 'Y' ELSE 'N' END AS "Last_Movement_Is_PGI_3120"
+        FROM so_3120 s
+        LEFT JOIN "SAPHANADB"."NSDM_V_MSEG" m
+          ON m."KDAUF" = s."SalesOrder_3120"
+         AND m."BWART" IN ('601','602')
+        GROUP BY s."Chassis"
+    ),
+    move_3110 AS (
+        SELECT
+            s."Chassis",
+            MAX(CASE WHEN m."BWART"='601' THEN m."MBLNR" END) AS "SalesOrderPGI_Doc_3110",
+            MAX(CASE WHEN m."BWART"='601' THEN m."BUDAT_MKPF" END) AS "PGI_Date_3110",
+            CASE WHEN SUM(CASE WHEN m."BWART"='602' THEN 1 ELSE 0 END) > 0 THEN 'Y' ELSE 'N' END AS "Reverse_PGI_3110",
+            CASE WHEN MAX(m."BWART") = '601' THEN 'Y' ELSE 'N' END AS "Last_Movement_Is_PGI_3110"
+        FROM so_3110 s
+        LEFT JOIN "SAPHANADB"."NSDM_V_MSEG" m
+          ON m."KDAUF" = s."SalesOrder_3110"
+         AND m."BWART" IN ('601','602')
+        GROUP BY s."Chassis"
+    ),
+    bill_3120 AS (
+        SELECT
+            s."Chassis",
+            MAX(vbrp."VBELN") AS "Invoice_No_3120"
+        FROM so_3120 s
+        LEFT JOIN "SAPHANADB"."VBRP" vbrp
+          ON vbrp."AUBEL" = s."SalesOrder_3120"
+        GROUP BY s."Chassis"
+    ),
+    po_3120 AS (
+        SELECT
+            s."Chassis",
+            COALESCE(
+                MAX(CASE WHEN ekpo."WERKS" = '3121' THEN ekko."EBELN" END),
+                MAX(ekko."EBELN")
+            ) AS "PO_Number_3120",
+            COUNT(DISTINCT ekko."EBELN") AS "PO_Number_Count",
+            COALESCE(
+                MAX(CASE WHEN ekpo."WERKS" = '3121' THEN ekko."ERNAM" END),
+                MAX(ekko."ERNAM")
+            ) AS "PO_Creator"
+        FROM so_3120 s
+        LEFT JOIN "SAPHANADB"."EKPO" ekpo
+          ON ekpo."KDAUF" = s."SalesOrder_3120"
+        LEFT JOIN "SAPHANADB"."EKKO" ekko
+          ON ekko."EBELN" = ekpo."EBELN"
+        GROUP BY s."Chassis"
+    ),
+    gr_3120 AS (
+        SELECT
+            p."Chassis",
+            MAX(ekbe."BUDAT") AS "PO_GR_Date_3120"
+        FROM po_3120 p
+        LEFT JOIN "SAPHANADB"."EKBE" ekbe
+          ON ekbe."EBELN" = p."PO_Number_3120"
+         AND ekbe."VGABE" = '1'
+        GROUP BY p."Chassis"
+    ),
+    bp_3110 AS (
+        SELECT
+            s."Chassis",
+            MAX(vbpa."KUNNR") AS "BillTo_3110"
+        FROM so_3110 s
+        LEFT JOIN "SAPHANADB"."VBPA" vbpa
+          ON vbpa."VBELN" = s."SalesOrder_3110"
+         AND vbpa."PARVW" = 'RE'
+        GROUP BY s."Chassis"
+    ),
+    bp_3120 AS (
+        SELECT
+            s."Chassis",
+            MAX(vbpa."KUNNR") AS "BillTo_3120"
+        FROM so_3120 s
+        LEFT JOIN "SAPHANADB"."VBPA" vbpa
+          ON vbpa."VBELN" = s."SalesOrder_3120"
+         AND vbpa."PARVW" = 'RE'
+        GROUP BY s."Chassis"
+    ),
+    bp_name_3120 AS (
+        SELECT
+            b."Chassis",
+            MAX(kna1."NAME1") AS "BillTo_Name_3120"
+        FROM bp_3120 b
+        LEFT JOIN "SAPHANADB"."KNA1" kna1
+          ON kna1."KUNNR" = b."BillTo_3120"
+        GROUP BY b."Chassis"
+    ),
+    bp_recv AS (
+        SELECT
+            b."Chassis",
+            SUM(bsad."DMBTR") AS "BP_Received_Amount_3120"
+        FROM bp_3120 b
+        LEFT JOIN "SAPHANADB"."BSAD" bsad
+          ON bsad."KUNNR" = b."BillTo_3120"
+        GROUP BY b."Chassis"
+    )
     SELECT
-        obj."SERNR" AS "Chassis",
-        COUNT(DISTINCT vbak."VBELN") AS "SalesOrder_Count",
-        SUM(CASE WHEN mseg."BWART"='601' THEN 1 ELSE 0 END) AS "PGI_Count",
-        SUM(CASE WHEN mseg."BWART"='602' THEN 1 ELSE 0 END) AS "Reverse_Count",
-        MAX(mseg."BUDAT_MKPF") AS "Last_Movement_Date",
-        MAX(mseg."BWART") AS "Last_Movement_Type"
-
-    FROM "SAPHANADB"."OBJK" obj
-    LEFT JOIN "SAPHANADB"."SER02" s
-        ON obj."OBKNR" = s."OBKNR"
-    LEFT JOIN "SAPHANADB"."VBAK" vbak
-        ON s."SDAUFNR" = vbak."VBELN"
-       AND vbak."VKORG" = '3120'
-    LEFT JOIN "SAPHANADB"."NSDM_V_MSEG" mseg
-        ON mseg."KDAUF" = vbak."VBELN"
-
-    WHERE obj."SERNR" IN {in_list}
-
-    GROUP BY obj."SERNR"
+        t."Chassis",
+        s3120."SalesOrder_3120",
+        s3110."SalesOrder_3110",
+        m3120."SalesOrderPGI_Doc_3120",
+        m3110."SalesOrderPGI_Doc_3110",
+        m3120."PGI_Date_3120",
+        m3110."PGI_Date_3110",
+        m3120."Reverse_PGI_3120",
+        m3110."Reverse_PGI_3110",
+        m3120."Last_Movement_Is_PGI_3120",
+        m3110."Last_Movement_Is_PGI_3110",
+        b3120."Invoice_No_3120",
+        p3120."PO_Number_3120",
+        p3120."PO_Number_Count",
+        g3120."PO_GR_Date_3120",
+        bp3110."BillTo_3110",
+        bp3120."BillTo_3120",
+        recv."BP_Received_Amount_3120",
+        p3120."PO_Creator",
+        s3120."SO_Creator_3120",
+        bpname."BillTo_Name_3120"
+    FROM target t
+    LEFT JOIN so_3120 s3120 ON t."Chassis" = s3120."Chassis"
+    LEFT JOIN so_3110 s3110 ON t."Chassis" = s3110."Chassis"
+    LEFT JOIN move_3120 m3120 ON t."Chassis" = m3120."Chassis"
+    LEFT JOIN move_3110 m3110 ON t."Chassis" = m3110."Chassis"
+    LEFT JOIN bill_3120 b3120 ON t."Chassis" = b3120."Chassis"
+    LEFT JOIN po_3120 p3120 ON t."Chassis" = p3120."Chassis"
+    LEFT JOIN gr_3120 g3120 ON t."Chassis" = g3120."Chassis"
+    LEFT JOIN bp_3110 bp3110 ON t."Chassis" = bp3110."Chassis"
+    LEFT JOIN bp_3120 bp3120 ON t."Chassis" = bp3120."Chassis"
+    LEFT JOIN bp_name_3120 bpname ON t."Chassis" = bpname."Chassis"
+    LEFT JOIN bp_recv recv ON t."Chassis" = recv."Chassis"
     """
 
-    return hana_query(sql)
+    df = hana_query(sql)
+    df = df_mismatch.merge(df, on="Chassis", how="left")
+    for c in DETAIL_COLUMNS:
+        if c not in df.columns:
+            df[c] = None
+    return df[DETAIL_COLUMNS]
+
+
+# ================= STEP 4: Summary =================
+
+def build_summary(df_mismatch, df_detail, sap_set):
+    list_total = len(COUNT_LIST)
+    sap_total = len(sap_set)
+    mismatch_total = len(df_mismatch)
+    only_in_list = int((df_mismatch["Mismatch_Type"] == "Only in List").sum()) if not df_mismatch.empty else 0
+    only_in_sap = int((df_mismatch["Mismatch_Type"] == "Only in SAP").sum()) if not df_mismatch.empty else 0
+
+    po_series = pd.Series(dtype="object")
+    po_gr_series = pd.Series(dtype="object")
+    if not df_detail.empty:
+        po_series = df_detail["PO_Number_3120"].dropna().astype(str).str.strip()
+        po_series = po_series[po_series != ""]
+
+        po_gr_series = df_detail.loc[df_detail["PO_GR_Date_3120"].notna(), "PO_Number_3120"].dropna().astype(str).str.strip()
+        po_gr_series = po_gr_series[po_gr_series != ""]
+
+    po_total = int(po_series.nunique())
+    po_gr_done = int(po_gr_series.nunique())
+    po_not_gr = po_total - po_gr_done
+
+    return pd.DataFrame([
+        ["List_Total", list_total],
+        ["SAP_Total", sap_total],
+        ["Mismatch_Total", mismatch_total],
+        ["Only_in_List", only_in_list],
+        ["Only_in_SAP", only_in_sap],
+        ["PO_Total_In_System", po_total],
+        ["PO_GR_Done", po_gr_done],
+        ["PO_Not_GR", po_not_gr],
+    ], columns=["Metric", "Value"])
 
 
 # ================= MAIN =================
 
 def main():
+    output_file = "StJames_Audit_Final.xlsx"
 
-    sap_set = fetch_true_stock()
+    df_mismatch = pd.DataFrame(columns=["Chassis", "Mismatch_Type"])
+    df_detail = pd.DataFrame(columns=DETAIL_COLUMNS)
+    df_summary = pd.DataFrame(columns=["Metric", "Value"])
+    error_message = None
+    sap_set = set()
 
-    df_mismatch = build_mismatch(sap_set)
+    try:
+        sap_set = fetch_true_stock()
+        df_mismatch = build_mismatch(sap_set)
+        df_detail = fetch_mismatch_details(df_mismatch)
+        df_summary = build_summary(df_mismatch, df_detail, sap_set)
+    except Exception as exc:
+        error_message = str(exc)
+        log.exception("Pipeline failed, writing fallback workbook with error info.")
+        df_summary = pd.DataFrame([
+            ["List_Total", len(COUNT_LIST)],
+            ["SAP_Total", 0],
+            ["Mismatch_Total", 0],
+            ["Only_in_List", 0],
+            ["Only_in_SAP", 0],
+            ["PO_Total_In_System", 0],
+            ["PO_GR_Done", 0],
+            ["PO_Not_GR", 0],
+            ["Error", error_message],
+        ], columns=["Metric", "Value"])
+        df_mismatch = pd.DataFrame([["ERROR", error_message]], columns=["Chassis", "Mismatch_Type"])
+        df_detail = pd.DataFrame([["ERROR", "Pipeline failed"] + [None] * (len(DETAIL_COLUMNS) - 2)], columns=DETAIL_COLUMNS)
 
-    mismatch_list = df_mismatch["Chassis"].tolist()
-
-    df_stats = fetch_statistics(mismatch_list)
-
-    df_stats = df_stats.merge(df_mismatch, on="Chassis", how="left")
-
-    with pd.ExcelWriter("StJames_Audit_Final.xlsx") as writer:
+    with pd.ExcelWriter(output_file) as writer:
+        df_summary.to_excel(writer, sheet_name="Summary", index=False)
         df_mismatch.to_excel(writer, sheet_name="Mismatch_List", index=False)
-        df_stats.to_excel(writer, sheet_name="Mismatch_Statistics", index=False)
+        df_detail.to_excel(writer, sheet_name="Mismatch_Detail", index=False)
 
-    log.info("Audit complete.")
+    log.info("Audit complete. Output file: %s", output_file)
+
 
 if __name__ == "__main__":
     main()
