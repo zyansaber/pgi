@@ -123,9 +123,40 @@ def build_mismatch(sap_set):
     return pd.DataFrame(rows, columns=["Chassis","Mismatch_Type"])
 
 
+def build_summary(sap_set, df_mismatch):
+    return pd.DataFrame(
+        [
+            ["List_Total", len(set(COUNT_LIST))],
+            ["SAP_Total", len(set(sap_set))],
+            ["Mismatch_Total", len(df_mismatch)],
+            [
+                "Only_in_List",
+                int((df_mismatch["Mismatch_Type"] == "Only in List").sum()),
+            ],
+            [
+                "Only_in_SAP",
+                int((df_mismatch["Mismatch_Type"] == "Only in SAP").sum()),
+            ],
+        ],
+        columns=["Metric", "Count"],
+    )
+
+
 # ================= STEP 3A: 统计 (3120 only) =================
 
 def fetch_statistics(serial_list):
+
+    if not serial_list:
+        return pd.DataFrame(
+            columns=[
+                "Chassis",
+                "SalesOrder_Count",
+                "PGI_Count",
+                "Reverse_Count",
+                "Last_Movement_Date",
+                "Last_Movement_Type",
+            ]
+        )
 
     in_list = "(" + ",".join(f"'{c}'" for c in serial_list) + ")"
 
@@ -155,6 +186,76 @@ def fetch_statistics(serial_list):
     return hana_query(sql)
 
 
+def fetch_mismatch_details(serial_list):
+
+    if not serial_list:
+        return pd.DataFrame(
+            columns=[
+                "Chassis",
+                "SalesOrderPGI_Doc",
+                "PGI_Date",
+                "Invoice_No",
+                "Invoice_Date",
+                "PO_Number",
+                "PO_Receive_Date",
+                "Inventory_In_Date",
+                "Mismatch_Type",
+                "SalesOrder_3110",
+                "BillTo_3110",
+            ]
+        )
+
+    in_list = "(" + ",".join(f"'{c}'" for c in serial_list) + ")"
+
+    sql = f"""
+    WITH base AS (
+        SELECT DISTINCT
+            obj."SERNR" AS "Chassis",
+            s."SDAUFNR" AS "SalesOrder"
+        FROM "SAPHANADB"."OBJK" obj
+        LEFT JOIN "SAPHANADB"."SER02" s
+            ON obj."OBKNR" = s."OBKNR"
+        WHERE obj."SERNR" IN {in_list}
+    )
+    SELECT
+        b."Chassis",
+        MAX(CASE WHEN m601."BWART"='601' THEN m601."MBLNR" END) AS "SalesOrderPGI_Doc",
+        MAX(CASE WHEN m601."BWART"='601' THEN m601."BUDAT_MKPF" END) AS "PGI_Date",
+        MAX(vbrk."VBELN") AS "Invoice_No",
+        MAX(vbrk."FKDAT") AS "Invoice_Date",
+        MAX(v3120."BSTNK") AS "PO_Number",
+        MAX(CASE WHEN m101."BWART"='101' THEN m101."BUDAT_MKPF" END) AS "PO_Receive_Date",
+        MIN(mall."BUDAT_MKPF") AS "Inventory_In_Date",
+        MAX(v3110."VBELN") AS "SalesOrder_3110",
+        MAX(bp."KUNNR") AS "BillTo_3110"
+    FROM base b
+    LEFT JOIN "SAPHANADB"."VBAK" v3120
+        ON b."SalesOrder" = v3120."VBELN"
+       AND v3120."VKORG" = '3120'
+    LEFT JOIN "SAPHANADB"."VBAK" v3110
+        ON b."SalesOrder" = v3110."VBELN"
+       AND v3110."VKORG" = '3110'
+    LEFT JOIN "SAPHANADB"."VBPA" bp
+        ON bp."VBELN" = v3110."VBELN"
+       AND bp."PARVW" = 'RE'
+    LEFT JOIN "SAPHANADB"."NSDM_V_MSEG" m601
+        ON m601."KDAUF" = v3120."VBELN"
+       AND m601."BWART" = '601'
+    LEFT JOIN "SAPHANADB"."NSDM_V_MSEG" m101
+        ON m101."KDAUF" = v3120."VBELN"
+       AND m101."BWART" = '101'
+    LEFT JOIN "SAPHANADB"."NSDM_V_MSEG" mall
+        ON mall."KDAUF" = v3120."VBELN"
+    LEFT JOIN "SAPHANADB"."VBRP" vbrp
+        ON vbrp."AUBEL" = v3120."VBELN"
+    LEFT JOIN "SAPHANADB"."VBRK" vbrk
+        ON vbrk."VBELN" = vbrp."VBELN"
+    GROUP BY b."Chassis"
+    """
+
+    return hana_query(sql)
+
+
 # ================= MAIN =================
 
 def main():
@@ -162,15 +263,40 @@ def main():
     sap_set = fetch_true_stock()
 
     df_mismatch = build_mismatch(sap_set)
+    df_summary = build_summary(sap_set, df_mismatch)
 
     mismatch_list = df_mismatch["Chassis"].tolist()
 
     df_stats = fetch_statistics(mismatch_list)
+    df_detail = fetch_mismatch_details(mismatch_list)
 
     df_stats = df_stats.merge(df_mismatch, on="Chassis", how="left")
+    df_detail = df_detail.merge(df_mismatch, on="Chassis", how="left")
+    if "Mismatch_Type_x" in df_detail.columns:
+        df_detail["Mismatch_Type"] = df_detail["Mismatch_Type_y"].combine_first(
+            df_detail["Mismatch_Type_x"]
+        )
+        df_detail = df_detail.drop(columns=["Mismatch_Type_x", "Mismatch_Type_y"])
+
+    detail_cols = [
+        "Chassis",
+        "SalesOrderPGI_Doc",
+        "PGI_Date",
+        "Invoice_No",
+        "Invoice_Date",
+        "PO_Number",
+        "PO_Receive_Date",
+        "Inventory_In_Date",
+        "Mismatch_Type",
+        "SalesOrder_3110",
+        "BillTo_3110",
+    ]
+    df_detail = df_detail.reindex(columns=detail_cols)
 
     with pd.ExcelWriter("StJames_Audit_Final.xlsx") as writer:
+        df_summary.to_excel(writer, sheet_name="Summary", index=False)
         df_mismatch.to_excel(writer, sheet_name="Mismatch_List", index=False)
+        df_detail.to_excel(writer, sheet_name="Mismatch_Detail", index=False)
         df_stats.to_excel(writer, sheet_name="Mismatch_Statistics", index=False)
 
     log.info("Audit complete.")
