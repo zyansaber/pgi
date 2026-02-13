@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Rebuild Firebase to legacy paths & format (+ Sales Order total NETWR + VIN + handover bill-to customer)
+Rebuild Firebase to legacy paths & format (+ Sales Order total NETWR + VIN + handover bill-to customer + handover item material/invoice)
 
 变更点（按你的要求）：
 1) 不导出 Excel
@@ -11,6 +11,7 @@ Rebuild Firebase to legacy paths & format (+ Sales Order total NETWR + VIN + han
 5) /handover.customer 写：门店 PGI 的 sales order (VBELN) 对应 Bill-to 名称（VBPA PARVW='RE'）
 6) ✅ 新增写入 /pgirecord 字段：poNumber, vendorName, poPrice, grDateLast, grStatus
    - 注意：写 pgirecord 时采用“多路径 update”只更新指定字段，不会覆盖你之前写入的其它字段e
+7) ✅ 新增写入 /handover 字段：materialCode(销售订单0010行 MATNR), invoiceNumber(发票号)
 """
 
 from __future__ import annotations
@@ -529,6 +530,58 @@ def fetch_billto_name_map(vbelns: List[str]) -> pd.DataFrame:
     df["billto_name"] = df["billto_name"].astype("string").str.strip()
     return df.drop_duplicates("VBELN", keep="last").reset_index(drop=True)
 
+def fetch_handover_material_invoice_map(vbelns: List[str]) -> pd.DataFrame:
+    """
+    返回：VBELN, materialCode, invoiceNumber
+    - materialCode: 销售订单 0010 行 (VBAP.POSNR='000010') 的 MATNR
+    - invoiceNumber: 该订单 0010 行关联发票号（按开票日期倒序取最新）
+    """
+    vbelns = [v for v in pd.unique(pd.Series(vbelns).dropna().astype(str)) if v]
+    if not vbelns:
+        return pd.DataFrame(columns=["VBELN", "materialCode", "invoiceNumber"])
+
+    all_rows = []
+    for batch in _chunked(vbelns, 900):
+        in_list = _sql_list(batch)
+        sql = f'''
+        WITH inv_latest AS (
+            SELECT
+                p."AUBEL" AS "VBELN",
+                p."VBELN" AS "invoiceNumber",
+                ROW_NUMBER() OVER (
+                    PARTITION BY p."AUBEL"
+                    ORDER BY k."FKDAT" DESC, p."VBELN" DESC
+                ) AS rn
+            FROM "SAPHANADB"."VBRP" p
+            LEFT JOIN "SAPHANADB"."VBRK" k
+                   ON k."VBELN" = p."VBELN"
+            WHERE p."AUPOS" = '000010'
+              AND p."AUBEL" IN {in_list}
+        )
+        SELECT
+            v."VBELN",
+            i."MATNR" AS "materialCode",
+            il."invoiceNumber"
+        FROM "SAPHANADB"."VBAK" v
+        LEFT JOIN "SAPHANADB"."VBAP" i
+               ON i."VBELN" = v."VBELN"
+              AND i."POSNR" = '000010'
+        LEFT JOIN inv_latest il
+               ON il."VBELN" = v."VBELN"
+              AND il.rn = 1
+        WHERE v."VBELN" IN {in_list}
+        '''
+        all_rows.append(hana_query(sql))
+
+    df = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame(columns=["VBELN", "materialCode", "invoiceNumber"])
+    if df.empty:
+        return pd.DataFrame(columns=["VBELN", "materialCode", "invoiceNumber"])
+
+    df["VBELN"] = df["VBELN"].astype(str).str.strip()
+    df["materialCode"] = df["materialCode"].astype("string").str.strip()
+    df["invoiceNumber"] = df["invoiceNumber"].astype("string").str.strip()
+    return df.drop_duplicates("VBELN", keep="last").reset_index(drop=True)
+
 # ---------- builders ----------
 def build_pgirecord_df(ser_pgi: pd.DataFrame, orderlist: pd.DataFrame) -> pd.DataFrame:
     ser = ser_pgi.copy()
@@ -635,10 +688,11 @@ def build_handover_records(df_special_pgi_orders: pd.DataFrame,
     """
     createdAt / handoverAt：dd/mm/yyyy
     customer：使用 df_special_pgi_orders.customer（Bill-to name），为空则 'NA'
+    materialCode / invoiceNumber：来自销售订单 0010 行及其关联发票
     """
     if df_special_pgi_orders.empty:
         return pd.DataFrame(columns=[
-            "dealerSlug","chassis","createdAt","handoverAt","dealerName","model","customer","source"
+            "dealerSlug","chassis","createdAt","handoverAt","dealerName","model","customer","materialCode","invoiceNumber","source"
         ])
 
     df = df_special_pgi_orders.copy()
@@ -678,6 +732,8 @@ def build_handover_records(df_special_pgi_orders: pd.DataFrame,
         "dealerName": df["dealerName"],
         "model":      df["model_final"],
         "customer":   df["customer_final"],
+        "materialCode": df.get("materialCode"),
+        "invoiceNumber": df.get("invoiceNumber"),
         "source":     "SAPdata",
     })
     return out[out["chassis"].astype(bool)].reset_index(drop=True)
@@ -856,6 +912,7 @@ def write_handover_special_dealers_only(df: pd.DataFrame, allowed_dealers: Set[s
     - 不影响其它 dealer
     - createdAt/handoverAt 已是 dd/mm/yyyy
     - customer 写 bill-to name
+    - materialCode / invoiceNumber 分别写入销售订单0010行物料与发票号
     """
     allowed_slugs = {dealer_key_slug(d) for d in allowed_dealers if dealer_key_slug(d)}
 
@@ -887,6 +944,8 @@ def write_handover_special_dealers_only(df: pd.DataFrame, allowed_dealers: Set[s
                 "dealerSlug": slug,
                 "model": None if pd.isna(r.get("model")) else str(r.get("model")),
                 "customer": None if pd.isna(r.get("customer")) else str(r.get("customer")),
+                "materialCode": None if pd.isna(r.get("materialCode")) else str(r.get("materialCode")),
+                "invoiceNumber": None if pd.isna(r.get("invoiceNumber")) else str(r.get("invoiceNumber")),
                 "source": "SAPdata",
             }
 
@@ -1054,10 +1113,11 @@ def main():
         log.error("构建 special_pgi_orders 失败：%s（以空表继续）", e)
         df_special_pgi_orders = pd.DataFrame(columns=["chassis","pgidate","dealer","vbeln","pgi_werks","lgort"])
 
-    # ------- Bill-to customer for handover -------
+    # ------- handover: Bill-to / materialCode / invoiceNumber -------
     try:
         if (not args.skip_hana) and (not df_special_pgi_orders.empty) and ("vbeln" in df_special_pgi_orders.columns):
             vbelns_store = df_special_pgi_orders["vbeln"].dropna().astype(str).str.strip().unique().tolist()
+
             log.info("查询 Bill-to 名称（handover.customer）（%d 个 sales order）…", len(vbelns_store))
             df_billto = fetch_billto_name_map(vbelns_store)
             if not df_billto.empty:
@@ -1067,11 +1127,25 @@ def main():
                 df_special_pgi_orders.rename(columns={"billto_name": "customer"}, inplace=True)
             else:
                 df_special_pgi_orders["customer"] = None
+
+            log.info("查询 handover.materialCode/invoiceNumber（%d 个 sales order）…", len(vbelns_store))
+            df_handover_extra = fetch_handover_material_invoice_map(vbelns_store)
+            if not df_handover_extra.empty:
+                df_special_pgi_orders = df_special_pgi_orders.merge(
+                    df_handover_extra, how="left", left_on="vbeln", right_on="VBELN"
+                ).drop(columns=["VBELN"])
+            else:
+                df_special_pgi_orders["materialCode"] = None
+                df_special_pgi_orders["invoiceNumber"] = None
         else:
             df_special_pgi_orders["customer"] = None
+            df_special_pgi_orders["materialCode"] = None
+            df_special_pgi_orders["invoiceNumber"] = None
     except Exception as e:
-        log.error("Bill-to 名称查询失败：%s（handover.customer 置空）", e)
+        log.error("handover 信息查询失败：%s（customer/materialCode/invoiceNumber 置空）", e)
         df_special_pgi_orders["customer"] = None
+        df_special_pgi_orders["materialCode"] = None
+        df_special_pgi_orders["invoiceNumber"] = None
 
     # ------- 写库（若非 dry-run） -------
     if args.dry_run:
